@@ -137,3 +137,56 @@ class TestPortfolioBacktesting:
         assert trades[1].volume == 2
         assert trades[1].price == 200
         assert trades[1].datetime == t2
+
+
+class MarketOnceStrategy(StrategyTemplate):
+    def on_init(self) -> None:
+        self.submitted = False
+
+    def on_bars(self, bars: dict[str, BarData]) -> None:
+        if self.submitted:
+            return
+        engine: BacktestingEngine = self.strategy_engine
+        orderids = engine.send_market_order(self, RB, Direction.LONG, Offset.OPEN, 1)
+        self.active_orderids.update(orderids)
+        self.submitted = True
+
+
+def run_market_sample(engine: BacktestingEngine) -> BacktestingEngine:
+    engine.output = lambda message: None
+    engine.set_parameters(
+        vt_symbols=[RB], interval=Interval.MINUTE, start=datetime(2024, 1, 2),
+        end=datetime(2024, 1, 2), rates={RB: 0}, slippages={RB: 0},
+        sizes={RB: 10}, priceticks={RB: 1}, capital=100000,
+    )
+    engine.add_strategy(MarketOnceStrategy, {})
+    for bar in [
+        make_bar(RB_SYMBOL, datetime(2024, 1, 2, 9), 100, 101, 99, 100),
+        make_bar(RB_SYMBOL, datetime(2024, 1, 2, 9, 1), 110, 111, 109, 110),
+    ]:
+        engine.dts.add(bar.datetime)
+        engine.history_data[(bar.datetime, bar.vt_symbol)] = bar
+    engine.run_backtesting()
+    return engine
+
+
+def test_market_order_fills_at_next_bar_open_after_gap() -> None:
+    engine = run_market_sample(BacktestingEngine())
+    trade = next(iter(engine.trades.values()))
+    assert trade.price == 110
+    assert trade.datetime == datetime(2024, 1, 2, 9, 1)
+    assert engine.strategy.get_pos(RB) == 1
+
+
+def test_pre_fill_hook_can_reject_order() -> None:
+    class RejectingEngine(BacktestingEngine):
+        def check_order(self, order: OrderData) -> bool:
+            order.status = Status.REJECTED
+            self.active_limit_orders.pop(order.vt_orderid)
+            self.strategy.update_order(order)
+            return False
+
+    engine = run_market_sample(RejectingEngine())
+    assert not engine.trades
+    assert not engine.active_limit_orders
+    assert next(iter(engine.limit_orders.values())).status == Status.REJECTED

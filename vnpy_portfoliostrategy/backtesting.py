@@ -13,7 +13,7 @@ from pandas import DataFrame, Series
 from collections.abc import Callable, Hashable
 from typing import Any, cast
 
-from vnpy.trader.constant import Direction, Exchange, Offset, Interval, Status
+from vnpy.trader.constant import Direction, Exchange, Offset, Interval, Status, OrderType
 from vnpy.trader.database import get_database, BaseDatabase
 from vnpy.trader.object import OrderData, TradeData, BarData
 from vnpy.trader.utility import round_to, extract_vt_symbol
@@ -641,17 +641,20 @@ class BacktestingEngine:
             # 检查可以被撮合的限价委托
             long_cross: bool = (
                 order.direction == Direction.LONG
-                and order.price >= long_cross_price
+                and (order.type == OrderType.MARKET or order.price >= long_cross_price)
                 and long_cross_price > 0
             )
 
             short_cross: bool = (
                 order.direction == Direction.SHORT
-                and order.price <= short_cross_price
+                and (order.type == OrderType.MARKET or order.price <= short_cross_price)
                 and short_cross_price > 0
             )
 
             if not long_cross and not short_cross:
+                continue
+
+            if not self.check_order(order):
                 continue
 
             # 推送委托成交状态更新
@@ -665,8 +668,10 @@ class BacktestingEngine:
             # 推送成交信息
             self.trade_count += 1
 
-            if long_cross:
-                trade_price: float = min(order.price, long_best_price)
+            if order.type == OrderType.MARKET:
+                trade_price: float = bar.open_price
+            elif long_cross:
+                trade_price = min(order.price, long_best_price)
             else:
                 trade_price = max(order.price, short_best_price)
 
@@ -685,6 +690,24 @@ class BacktestingEngine:
 
             self.strategy.update_trade(trade)
             self.trades[trade.vt_tradeid] = trade
+
+    def check_order(self, order: OrderData) -> bool:
+        """Extension point for pre-fill account and execution checks."""
+        return True
+
+    def send_market_order(
+        self,
+        strategy: StrategyTemplate,
+        vt_symbol: str,
+        direction: Direction,
+        offset: Offset,
+        volume: float,
+    ) -> list[str]:
+        """Submit an order for the next bar's open in historical replay."""
+        orderids = self.send_order(strategy, vt_symbol, direction, offset, 0, volume, False, False)
+        for orderid in orderids:
+            self.limit_orders[orderid].type = OrderType.MARKET
+        return orderids
 
     def load_bars(
         self,
